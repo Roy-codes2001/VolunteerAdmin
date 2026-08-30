@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,8 +15,25 @@ router = APIRouter(
 )
 
 
+# ============================================================
+# Constants
+# ============================================================
+
+DEFAULT_EXPIRATION_HOURS = 24
+
+
+# ============================================================
+# Request Models
+# ============================================================
+
 class NoticeCreateRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+    )
+
+    # If omitted, notice expires after 24 hours.
     expires_at: datetime | None = None
 
 
@@ -26,17 +43,50 @@ class NoticeUpdateRequest(BaseModel):
         min_length=1,
         max_length=2000,
     )
+
+    # Three possible meanings:
+    #
+    # omitted -> don't change expiration
+    # timestamp -> set new expiration
+    # null -> remove expiration
+    #
     expires_at: datetime | None = None
 
 
-def validate_expires_at(expires_at: datetime | None):
-    if expires_at is not None:
-        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-            raise HTTPException(
-                status_code=400,
-                detail="expires_at must include a timezone",
-            )
+# ============================================================
+# Validation
+# ============================================================
 
+def validate_expires_at(expires_at: datetime | None):
+    """
+    Validate a supplied expiration timestamp.
+
+    The timestamp must:
+    - contain timezone information
+    - be in the future
+    """
+
+    if expires_at is None:
+        return
+
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise HTTPException(
+            status_code=400,
+            detail="expires_at must include a timezone",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if expires_at <= now:
+        raise HTTPException(
+            status_code=400,
+            detail="expires_at must be in the future",
+        )
+
+
+# ============================================================
+# CREATE NOTICE
+# ============================================================
 
 @router.post("/notices")
 def create_notice(
@@ -46,16 +96,29 @@ def create_notice(
 ):
     pandal_id = str(current_user.id)
 
-    validate_expires_at(data.expires_at)
-
     try:
+        # -----------------------------------------------------
+        # 1. Determine expiration
+        # -----------------------------------------------------
+
+        if data.expires_at is None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(hours=DEFAULT_EXPIRATION_HOURS)
+            )
+        else:
+            validate_expires_at(data.expires_at)
+            expires_at = data.expires_at
+
+        # -----------------------------------------------------
+        # 2. Create notice
+        # -----------------------------------------------------
+
         notice_data = {
             "pandal_id": pandal_id,
             "message": data.message,
+            "expires_at": expires_at.isoformat(),
         }
-
-        if data.expires_at is not None:
-            notice_data["expires_at"] = data.expires_at.isoformat()
 
         result = (
             supabase_admin
@@ -64,7 +127,7 @@ def create_notice(
             .execute()
         )
 
-        if not result.data:
+        if not result or not result.data:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to create notice",
@@ -73,7 +136,7 @@ def create_notice(
         notice = result.data[0]
 
         # -----------------------------------------------------
-        # Activity log
+        # 3. Activity log
         # -----------------------------------------------------
 
         log_activity(
@@ -84,14 +147,14 @@ def create_notice(
             old_value=None,
             new_value={
                 "message": data.message,
-                "expires_at": (
-                    data.expires_at.isoformat()
-                    if data.expires_at is not None
-                    else None
-                ),
+                "expires_at": expires_at.isoformat(),
             },
             request=request,
         )
+
+        # -----------------------------------------------------
+        # 4. Response
+        # -----------------------------------------------------
 
         return {
             "message": "Notice created successfully",
@@ -109,6 +172,10 @@ def create_notice(
             detail="Failed to create notice",
         )
 
+
+# ============================================================
+# GET NOTICES
+# ============================================================
 
 @router.get("/notices")
 def get_notices(
@@ -134,12 +201,18 @@ def get_notices(
             "notices": result.data or [],
         }
 
-    except Exception:
+    except Exception as e:
+        print("NOTICE GET ERROR:", repr(e))
+
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch notices",
         )
 
+
+# ============================================================
+# UPDATE NOTICE
+# ============================================================
 
 @router.put("/notices/{notice_id}")
 def update_notice(
@@ -150,24 +223,22 @@ def update_notice(
 ):
     pandal_id = str(current_user.id)
 
-    validate_expires_at(data.expires_at)
-
     try:
         # -----------------------------------------------------
-        # 1. Verify that the notice belongs to this pandal
+        # 1. Verify notice belongs to this pandal
         # -----------------------------------------------------
 
         existing = (
             supabase_admin
             .table("pandal_notices")
-            .select("id")
+            .select("id, message, expires_at")
             .eq("id", str(notice_id))
             .eq("pandal_id", pandal_id)
             .maybe_single()
             .execute()
         )
 
-        if not existing.data:
+        if not existing or not existing.data:
             raise HTTPException(
                 status_code=404,
                 detail="Notice not found",
@@ -182,8 +253,36 @@ def update_notice(
         if data.message is not None:
             update_data["message"] = data.message
 
-        if data.expires_at is not None:
-            update_data["expires_at"] = data.expires_at.isoformat()
+        # -----------------------------------------------------
+        # Expiration handling
+        #
+        # Since Pydantic cannot distinguish between:
+        #
+        #   "expires_at" omitted
+        #
+        # and
+        #
+        #   "expires_at": null
+        #
+        # we inspect the fields explicitly.
+        # -----------------------------------------------------
+
+        if "expires_at" in data.model_fields_set:
+
+            if data.expires_at is None:
+                # Explicit null = remove expiration
+                update_data["expires_at"] = None
+
+            else:
+                validate_expires_at(data.expires_at)
+
+                update_data["expires_at"] = (
+                    data.expires_at.isoformat()
+                )
+
+        # -----------------------------------------------------
+        # 3. Make sure something was actually supplied
+        # -----------------------------------------------------
 
         if not update_data:
             raise HTTPException(
@@ -192,7 +291,7 @@ def update_notice(
             )
 
         # -----------------------------------------------------
-        # 3. Update database
+        # 4. Update database
         # -----------------------------------------------------
 
         result = (
@@ -204,14 +303,14 @@ def update_notice(
             .execute()
         )
 
-        if not result.data:
+        if not result or not result.data:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to update notice",
             )
 
         # -----------------------------------------------------
-        # 4. Activity log
+        # 5. Activity log
         # -----------------------------------------------------
 
         log_activity(
@@ -223,6 +322,10 @@ def update_notice(
             new_value=update_data,
             request=request,
         )
+
+        # -----------------------------------------------------
+        # 6. Response
+        # -----------------------------------------------------
 
         return {
             "message": "Notice updated successfully",
@@ -240,6 +343,10 @@ def update_notice(
             detail="Failed to update notice",
         )
 
+
+# ============================================================
+# DELETE NOTICE
+# ============================================================
 
 @router.delete("/notices/{notice_id}")
 def delete_notice(
@@ -259,7 +366,7 @@ def delete_notice(
             .execute()
         )
 
-        if not result.data:
+        if not result or not result.data:
             raise HTTPException(
                 status_code=404,
                 detail="Notice not found",
