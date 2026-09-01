@@ -76,19 +76,6 @@ def update_visitor_info(
     pandal_id = str(current_user.id)
 
     try:
-        # -----------------------------------------------------
-        # 1. Check whether visitor information already exists
-        # -----------------------------------------------------
-
-        existing = (
-            supabase_admin
-            .table("pandal_visitor_info")
-            .select("pandal_id")
-            .eq("pandal_id", pandal_id)
-            .maybe_single()
-            .execute()
-        )
-
         visitor_data = {
             "pandal_id": pandal_id,
             "entry_information": data.entry_information,
@@ -98,33 +85,27 @@ def update_visitor_info(
         }
 
         # -----------------------------------------------------
-        # 2. Update or create visitor information
+        # 1. Create or update visitor information
         # -----------------------------------------------------
 
-        if existing.data:
-            result = (
-                supabase_admin
-                .table("pandal_visitor_info")
-                .update(visitor_data)
-                .eq("pandal_id", pandal_id)
-                .execute()
+        result = (
+            supabase_admin
+            .table("pandal_visitor_info")
+            .upsert(
+                visitor_data,
+                on_conflict="pandal_id",
             )
-        else:
-            result = (
-                supabase_admin
-                .table("pandal_visitor_info")
-                .insert(visitor_data)
-                .execute()
-            )
+            .execute()
+        )
 
-        if not result.data:
+        if not result or not result.data:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to update visitor information",
             )
 
         # -----------------------------------------------------
-        # 3. Activity log
+        # 2. Activity log
         # -----------------------------------------------------
 
         log_activity(
@@ -142,7 +123,7 @@ def update_visitor_info(
         )
 
         # -----------------------------------------------------
-        # 4. Return response
+        # 3. Return response
         # -----------------------------------------------------
 
         return {
@@ -153,7 +134,9 @@ def update_visitor_info(
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as e:
+        print("VISITOR INFO UPDATE ERROR:", repr(e))
+
         raise HTTPException(
             status_code=500,
             detail="Failed to update visitor information",

@@ -244,6 +244,14 @@ def get_photos(
             status_code=500,
             detail="Failed to fetch photos",
         )
+    
+    # except Exception as e:
+    #     print("PHOTO UPLOAD ERROR:", repr(e))
+
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=str(e),
+    #     )
 
 
 @router.delete("/photos/{photo_id}")
