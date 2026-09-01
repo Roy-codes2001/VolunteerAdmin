@@ -25,11 +25,13 @@ class RainStatus(str, Enum):
     clear = "CLEAR"
     light = "LIGHT"
     heavy = "HEAVY"
+    affecting_entry = "AFFECTING_ENTRY"
 
 
 class EntryStatus(str, Enum):
     open = "OPEN"
     closed = "CLOSED"
+    restricted = "RESTRICTED"
 
 
 class QuickUpdateRequest(BaseModel):
